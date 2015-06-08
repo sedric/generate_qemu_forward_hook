@@ -1,0 +1,53 @@
+#!/bin/bash
+
+CONF=/etc/kvmnat.conf
+TMP=`mktemp`
+HOOK=/etc/libvirt/hooks/qemu
+
+trap "rm -f $TMP" EXIT
+
+echo '#!/bin/sh' > $TMP
+
+grep -v '^#\|^$\|^\s*$' $CONF | \
+while read vmname ippub portpub ipnat portnat
+do
+  if [ -z "$vmname"  ] || \
+     [ -z "$ippub"   ] || \
+     [ -z "$portpub" ] || \
+     [ -z "$ipnat"   ] || \
+     [ -z "$portnat" ]
+  then
+    # That's a poor check, it should do better...
+    ERROR="Incomplete rule: $vmname $ippub $portpub $ipnat $portnat"
+    break
+  fi
+
+  # Get the interface, without the 'alias' (after the ':') because iptables
+  # does not works well with it (it's just a hack for ifconfig after all...)
+  interface=$(ip addr show | sed -rn "s/.*$ippub.*global ([a-z]*[0-9]*).*/\1/p")
+  # Here come a template, values are modified on the fly by sed
+  sed "s/__vmname__/$vmname/g;s/__interface__/$interface/g;s/__ippub__/$ippub/g;s/__portpub__/$portpub/g;s/__ipnat__/$ipnat/g;s/__portnat__/$portnat/g" <( echo '
+
+if [[ $1 == "__vmname__" ]]
+then
+  if [[ $2 = "stopped" || $2 = "reconnect" ]]
+  then
+    /sbin/iptables -w --table nat --delete PREROUTING --in-interface __interface__ --d __ippub__ --protocol tcp --dport __portpub__ --jump DNAT --to-destination __ipnat__:__portnat__
+    /sbin/iptables -w --delete FORWARD --in-interface __interface__ --match state --state NEW --match tcp --protocol tcp --destination __ipnat__ --dport __portnat__ --jump ACCEPT
+  fi
+  if [[ $2 = "start" || $2 = "reconnect" ]]
+  then
+    /sbin/iptables -w --table nat --insert PREROUTING --in-interface __interface__ -d __ippub__ --protocol tcp --dport __portpub__ --jump DNAT --to-destination __ipnat__:__portnat__
+    /sbin/iptables -w --insert FORWARD --in-interface __interface__ --match state --state NEW --match tcp --protocol tcp --destination __ipnat__ --dport __portnat__ --jump ACCEPT
+  fi
+fi' )
+done >> $TMP
+
+if [ ! -z "$ERROR" ]
+then
+  echo "$ERROR" >&2
+  exit 1
+fi
+
+mv $TMP $HOOK
+chmod +x $HOOK
